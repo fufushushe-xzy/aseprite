@@ -1,0 +1,247 @@
+name: Release Build and Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 触发条件：推送 v1.0.0 格式的 tag
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          release_name: Aseprite ${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          body: |
+            ## Aseprite ${{ steps.get_version.outputs.version }}
+
+            ### Downloads
+            - **Windows**: `Aseprite-${{ steps.get_version.outputs.version }}-Windows-x64.zip`
+            - **macOS**: `Aseprite-${{ steps.get_version.outputs.version }}-macOS-arm64.zip`
+            - **Linux**: `Aseprite-${{ steps.get_version.outputs.version }}-Linux-x64.tar.gz`
+
+            ### Build Information
+            - Built from commit: ${{ github.sha }}
+            - Build date: ${{ github.event.head_commit.timestamp }}
+
+  build-windows:
+    name: Build Windows Release
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Skia
+        shell: bash
+        run: |
+          skia_url=$(source laf/misc/skia-url.sh | xargs)
+          skia_file=$(basename $skia_url)
+          curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
+          unzip "$skia_file" -d skia
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_UPDATER=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64)
+
+      - name: Build
+        shell: bash
+        run: |
+          cd build
+          ninja aseprite
+
+      - name: Package Windows Build
+        shell: bash
+        run: |
+          mkdir -p package/Aseprite
+          cp -r build/bin/* package/Aseprite/
+          cp -r data package/Aseprite/
+          cd package
+          7z a -tzip Aseprite-${{ needs.create-release.outputs.version }}-Windows-x64.zip Aseprite
+
+      - name: Upload Windows Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./package/Aseprite-${{ needs.create-release.outputs.version }}-Windows-x64.zip
+          asset_name: Aseprite-${{ needs.create-release.outputs.version }}-Windows-x64.zip
+          asset_content_type: application/zip
+
+  build-macos:
+    name: Build macOS Release
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Install Skia
+        shell: bash
+        run: |
+          skia_url=$(source laf/misc/skia-url.sh | xargs)
+          skia_file=$(basename $skia_url)
+          curl -L -o "$skia_file" "$skia_url"
+          unzip "$skia_file" -d skia
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=ON \
+            -DENABLE_UPDATER=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-arm64) \
+            -DPNG_ARM_NEON:STRING=on
+
+      - name: Build
+        shell: bash
+        run: |
+          cd build
+          ninja aseprite
+
+      - name: Package macOS Build
+        shell: bash
+        run: |
+          mkdir -p package/Aseprite.app
+          cp -r build/bin/* package/Aseprite.app/
+          cp -r data package/Aseprite.app/
+          cd package
+          zip -r Aseprite-${{ needs.create-release.outputs.version }}-macOS-arm64.zip Aseprite.app
+
+      - name: Upload macOS Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./package/Aseprite-${{ needs.create-release.outputs.version }}-macOS-arm64.zip
+          asset_name: Aseprite-${{ needs.create-release.outputs.version }}-macOS-arm64.zip
+          asset_content_type: application/zip
+
+  build-linux:
+    name: Build Linux Release
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+            libfontconfig1-dev
+
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Install Skia
+        shell: bash
+        run: |
+          skia_url=$(source laf/misc/skia-url.sh | xargs)
+          skia_file=$(basename $skia_url)
+          curl -L -o "$skia_file" "$skia_url"
+          unzip "$skia_file" -d skia
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          export CC=clang
+          export CXX=clang++
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++ \
+            -DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++ \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=ON \
+            -DENABLE_UPDATER=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64)
+
+      - name: Build
+        shell: bash
+        run: |
+          cd build
+          ninja aseprite
+
+      - name: Package Linux Build
+        shell: bash
+        run: |
+          mkdir -p package/Aseprite
+          cp -r build/bin/* package/Aseprite/
+          cp -r data package/Aseprite/
+          cd package
+          tar -czf Aseprite-${{ needs.create-release.outputs.version }}-Linux-x64.tar.gz Aseprite
+
+      - name: Upload Linux Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./package/Aseprite-${{ needs.create-release.outputs.version }}-Linux-x64.tar.gz
+          asset_name: Aseprite-${{ needs.create-release.outputs.version }}-Linux-x64.tar.gz
+          asset_content_type: application/gzip

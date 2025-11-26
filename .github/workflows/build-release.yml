@@ -1,0 +1,182 @@
+name: Quick Build Release
+
+# 简化版本：快速构建单个平台，用于测试或个人使用
+# 不自动创建 Release，只生成构建产物作为 artifact
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'ubuntu-latest'
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ${{ github.event.inputs.platform || 'ubuntu-latest' }}
+        include:
+          - os: ubuntu-latest
+            platform_name: Linux
+            artifact_name: aseprite-linux-x64
+            package_ext: tar.gz
+          - os: windows-latest
+            platform_name: Windows
+            artifact_name: aseprite-windows-x64
+            package_ext: zip
+          - os: macos-latest
+            platform_name: macOS
+            artifact_name: aseprite-macos-arm64
+            package_ext: zip
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+            libfontconfig1-dev
+
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Skia
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            skia_url=$(source laf/misc/skia-url.sh | xargs)
+          else
+            skia_url=$(source laf/misc/skia-url.sh)
+          fi
+          skia_file=$(basename $skia_url)
+          curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
+          unzip "$skia_file" -d skia
+
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export CC=clang
+          export CXX=clang++
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++ \
+            -DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++ \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=ON \
+            -DENABLE_UPDATER=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64)
+
+      - name: Configure CMake (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=ON \
+            -DENABLE_UPDATER=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-arm64) \
+            -DPNG_ARM_NEON:STRING=on
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_UPDATER=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64)
+
+      - name: Build
+        shell: bash
+        run: |
+          cd build
+          ninja aseprite
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p package/aseprite
+          cp -r build/bin/* package/aseprite/
+          cp -r data package/aseprite/
+          cd package
+          tar -czf ${{ matrix.artifact_name }}.tar.gz aseprite
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p package/Aseprite.app
+          cp -r build/bin/* package/Aseprite.app/
+          cp -r data package/Aseprite.app/
+          cd package
+          zip -r ${{ matrix.artifact_name }}.zip Aseprite.app
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package/aseprite
+          cp -r build/bin/* package/aseprite/
+          cp -r data package/aseprite/
+          cd package
+          7z a -tzip ${{ matrix.artifact_name }}.zip aseprite
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: package/${{ matrix.artifact_name }}.${{ matrix.package_ext }}
+          retention-days: 30
+
+      - name: Build Summary
+        run: |
+          echo "## Build Complete! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform:** ${{ matrix.platform_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Artifact:** ${{ matrix.artifact_name }}.${{ matrix.package_ext }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the artifact from the Actions tab." >> $GITHUB_STEP_SUMMARY
